@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ERAMAS Luncheon Check-in</title>
+
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+
+<!-- ============================================================
+  ERAMAS GROUP Appreciation Luncheon – Guest check-in app
+  Hosted on GitHub Pages. Full set-up steps are in README.md.
+
+  HOW THE DATA IS PROTECTED
+  - The page is public, but it shows nothing until a crew member signs
+    in with an email + password that the organiser created in Firebase.
+  - firestore.rules (published in the Firebase console) decides who can
+    read and change the guest list. That is the real lock.
+  - FIREBASE_CONFIG below is NOT a secret. Firebase web config is meant
+    to be visible; the rules are what protect the data.
+  - ADMIN_EMAILS only shows or hides the organiser buttons. The real
+    admin check is in firestore.rules, so keep both lists the same.
+============================================================ -->
+<script>
+  window.FIREBASE_CONFIG = null; // paste here: { apiKey: "...", authDomain: "...", projectId: "...", appId: "..." }
+  window.ADMIN_EMAILS = ["admin@checkin.eramas.my"]; // lower-case, must match firestore.rules
+</script>
+
+<script src="https://cdn.tailwindcss.com/3.4.17"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { navy: '#1b2a4a', gold: '#b8901a', goldsoft: '#f6edd0', zA: '#1f5fad', zB: '#2e7d32', zC: '#d06a0a', zV: '#b8901a' },
+    fontFamily: { display: ['"Source Serif 4"', 'Cambria', 'Georgia', 'serif'], body: ['Figtree', '"Segoe UI"', 'system-ui', 'sans-serif'] } } } };
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: Figtree, "Segoe UI", system-ui, sans-serif; background: #f4f5f8; color: #172036; }
+  .tabnum { font-variant-numeric: tabular-nums; }
+  :focus-visible { outline: 3px solid #b8901a; outline-offset: 2px; }
+</style>
+</head>
+<body>
+<div id="root"><p style="padding:24px;font-family:sans-serif">Loading check-in app…</p></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+
+/* ---------------- Event set-up ---------------- */
+const TABLES = [];
+for (let n = 1; n <= 33; n++) TABLES.push({ key: String(n), label: 'Table ' + n, zone: n <= 11 ? 'A' : n <= 22 ? 'B' : 'C', cap: 10 });
+TABLES.push({ key: 'VVIP', label: 'VVIP', zone: 'V', cap: 15 }, { key: 'VIP 1', label: 'VIP 1', zone: 'V', cap: 10 }, { key: 'VIP 2', label: 'VIP 2', zone: 'V', cap: 10 });
+const TMAP = Object.fromEntries(TABLES.map(t => [t.key, t]));
+const ZONES = {
+  V: { name: 'VIP · Gold · VVIP, VIP 1, VIP 2', color: '#b8901a' },
+  A: { name: 'Zone A · Blue · Tables 1–11', color: '#1f5fad' },
+  B: { name: 'Zone B · Green · Tables 12–22', color: '#2e7d32' },
+  C: { name: 'Zone C · Orange · Tables 23–33', color: '#d06a0a' },
+};
+const COUNTERS = [['all', 'All'], ['A-H', 'Counter 1 · A–H'], ['I-M', 'Counter 2 · I–M'], ['N-Z', 'Counter 3 · N–Z'], ['vip', 'VIP / VVIP']];
+
+/* ---------------- Helpers ---------------- */
+const tLabel = k => (TMAP[k] ? TMAP[k].label : k || 'No table');
+const zColor = k => (TMAP[k] ? ZONES[TMAP[k].zone].color : '#dfe2ea');
+const norm = s => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+const fmtTime = ms => (ms ? new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '');
+const statusOf = g => (g.seated ? (g.checkedIn ? 'seat' : 'odd') : g.checkedIn ? 'reg' : 'none');
+const TITLE_RE = /^(?:mr\s*&\s*mrs|dr\s*&\s*mrs|tan sri|puan sri|datuk wira|datuk ir\.?|dato'?\s*sri|datin sri|datuk|dato'?|datin|mr\.?|mrs\.?|ms\.?|mdm|miss|dr\.?|yb|ir\.?)(?:\s+|(?<=\.))/i;
+const sortName = n => { let s = String(n || '').trim(), t; while ((t = s.replace(TITLE_RE, '')) !== s) s = t.trim(); return s; };
+const firstLetter = n => { const m = norm(sortName(n)).match(/^[^a-z\u3400-\u9fff]*([a-z])/); return m ? m[1] : null; };
+const isDiet = d => d && !/^(standard|none|normal|-)$/i.test(d);
+function inCounter(g, c) {
+  if (c === 'all') return true;
+  const vip = TMAP[g.table] && TMAP[g.table].zone === 'V';
+  if (c === 'vip') return vip;
+  if (vip) return false;
+  const [a, b] = c.toLowerCase().split('-'); const l = firstLetter(g.name);
+  if (!l) return c === 'A-H'; // names without Latin letters (e.g. Chinese) go to Counter 1
+  return l >= a && l <= b;
+}
+function normTable(v) {
+  const s = String(v || '').trim();
+  if (/^v\s*v\s*i\s*p/i.test(s)) return 'VVIP';
+  let m = s.match(/^vip\D*([12])$/i); if (m) return 'VIP ' + m[1];
+  m = s.match(/(\d+)/); if (m && +m[1] >= 1 && +m[1] <= 33 && !/vip/i.test(s)) return String(+m[1]);
+  return null;
+}
+function parseCSV(text) {
+  const rows = []; let row = [], cell = '', q = false;
+  const sep = /\t/.test(text.split('\n')[0]) ? '\t' : ',';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; } else if (c === '"') q = false; else cell += c; }
+    else if (c === '"') q = true; else if (c === sep) { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') { if (c === '\r' && text[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
+    else cell += c;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return rows.map(r => r.map(x => x.trim())).filter(r => r.some(Boolean));
+}
+function parseConfig(text) {
+  const s = text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1);
+  const json = s.replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, '$1"$2":').replace(/'/g, '"').replace(/,\s*}/g, '}');
+  const cfg = JSON.parse(json);
+  if (!cfg.apiKey || !cfg.projectId) throw new Error('The config needs at least apiKey and projectId.');
+  return cfg;
+}
+const blank = d => ({ checkedIn: false, checkedInAt: null, seated: false, seatedAt: null, ...d });
+function sampleRecords() {
+  const first = ['Ahmad', 'Siti', 'Tan', 'Lim', 'Wong', 'Nurul', 'Raj', 'Priya', 'Lee', 'Farah', 'Chong', 'Aisyah', 'Kumar', 'Ong', 'Hafiz', 'Mei', 'Daniel', 'Yap', 'Zulkifli', 'Grace'];
+  const last = ['Ismail', 'Ling', 'Wei Ming', 'Hui Min', 'Kar Wai', 'Izzati', 'Shankar', 'Devi', 'Jun Hao', 'Aziz', 'Siew Lan', 'Rahman', 'Ravi', 'Boon Keat', 'Hakim', 'Yee'];
+  const orgs = ['Sample Supplier Sdn Bhd', 'Sample Customer Bhd', 'Sample Bank Berhad', 'Friend of Eramas'];
+  const seats = []; TABLES.forEach(t => { for (let s = 0; s < t.cap; s++) seats.push(t.key); });
+  return seats.map((tbl, i) => ({ id: 'g' + String(i + 1).padStart(4, '0'), data: blank({
+    name: `${first[i % first.length]} ${last[Math.floor(i / first.length) % last.length]}${i >= first.length * last.length ? ' ' + (i + 1) : ''}`,
+    org: TMAP[tbl].zone === 'V' ? 'Sample VIP' : orgs[i % orgs.length], table: tbl,
+    draw: String(((i * 211) % 365) + 1).padStart(4, '0'), sample: true }) }));
+}
+
+/* ---------------- Data stores (Firebase or this-device demo) ---------------- */
+function makeFirebaseStore(cfg) {
+  const app = firebase.apps.length ? firebase.app() : firebase.initializeApp(cfg);
+  const db = firebase.firestore(app);
+  try { db.enablePersistence({ synchronizeTabs: true }).catch(() => {}); } catch (e) {}
+  const col = db.collection('guests');
+  const auth = firebase.auth(app);
+  return {
+    kind: 'firebase', auth,
+    subscribe(onData, onErr) {
+      return col.onSnapshot({ includeMetadataChanges: true }, snap => {
+        onData(snap.docs.map(d => ({ id: d.id, ...d.data() })), snap.metadata.fromCache);
+      }, onErr);
+    },
+    update: (id, patch) => col.doc(id).update(patch),
+    remove: id => col.doc(id).delete(),
+    async removeAll(ids, onProgress) {
+      for (let i = 0; i < ids.length; i += 400) {
+        const b = db.batch(); ids.slice(i, i + 400).forEach(id => b.delete(col.doc(id))); await b.commit();
+        onProgress(Math.min(i + 400, ids.length), ids.length);
+      }
+    },
+    // Signs out AND wipes the guest list cached on this device.
+    async signOut() {
+      try { await db.terminate(); await db.clearPersistence(); } catch (e) {}
+      await auth.signOut();
+    },
+    async replaceAll(records, existingIds, onProgress) {
+      const keep = new Set(records.map(r => r.id));
+      const ops = existingIds.filter(id => !keep.has(id)).map(id => b => b.delete(col.doc(id)))
+        .concat(records.map(r => b => b.set(col.doc(r.id), r.data)));
+      for (let i = 0; i < ops.length; i += 400) {
+        const b = db.batch(); ops.slice(i, i + 400).forEach(op => op(b)); await b.commit();
+        onProgress(Math.min(i + 400, ops.length), ops.length);
+      }
+    },
+    async patchMany(ids, patch) {
+      for (let i = 0; i < ids.length; i += 400) { const b = db.batch(); ids.slice(i, i + 400).forEach(id => b.update(col.doc(id), patch)); await b.commit(); }
+    },
+  };
+}
+function makeLocalStore() {
+  const KEY = 'eramas-checkin-demo';
+  const read = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { return {}; } };
+  const subs = new Set();
+  const emit = () => { const m = read(); const list = Object.entries(m).map(([id, d]) => ({ id, ...d })); subs.forEach(f => f(list, false)); };
+  const write = m => { localStorage.setItem(KEY, JSON.stringify(m)); emit(); };
+  window.addEventListener('storage', e => { if (e.key === KEY) emit(); });
+  return {
+    kind: 'local',
+    subscribe(onData) { subs.add(onData); setTimeout(emit, 0); return () => subs.delete(onData); },
+    async update(id, patch) { const m = read(); if (!m[id]) throw new Error('Guest not found'); m[id] = { ...m[id], ...patch }; write(m); },
+    async remove(id) { const m = read(); delete m[id]; write(m); },
+    async replaceAll(records, _ids, onProgress) { const m = {}; records.forEach(r => (m[r.id] = r.data)); write(m); onProgress(records.length, records.length); },
+    async patchMany(ids, patch) { const m = read(); ids.forEach(id => m[id] && (m[id] = { ...m[id], ...patch })); write(m); },
+    async removeAll(ids, onProgress) { write({}); onProgress(ids.length, ids.length); },
+  };
+}
+
+/* ---------------- Small UI pieces ---------------- */
+const PILL = { none: ['bg-slate-100 text-slate-500 border border-slate-200', 'Not arrived'], reg: ['bg-goldsoft text-amber-800', 'Registered'], seat: ['bg-green-100 text-green-800', 'Seated'], odd: ['bg-orange-100 text-red-700', 'Seated, not registered'] };
+const Pill = ({ g }) => { const [c, t] = PILL[statusOf(g)]; return <span className={`text-xs font-bold px-2.5 py-1 rounded-full whitespace-nowrap ${c}`}>{t}</span>; };
+const Chip = ({ on, children, onClick }) => (
+  <button onClick={onClick} aria-pressed={on} className={`px-3 py-1.5 rounded-full text-sm font-semibold border ${on ? 'bg-navy text-white border-navy' : 'bg-white border-slate-200 text-slate-700'}`}>{children}</button>
+);
+const Btn = ({ kind = 'primary', className = '', ...p }) => {
+  const k = { primary: 'bg-navy text-white', good: 'bg-green-700 text-white', ghost: 'bg-white border border-slate-300 text-slate-800', danger: 'bg-white border border-red-600 text-red-700' }[kind];
+  return <button {...p} className={`rounded-lg px-4 py-2.5 font-bold disabled:opacity-50 ${k} ${className}`} />;
+};
+
+/* ---------------- Set-up screen ---------------- */
+function Setup({ onConnect, onDemo, error }) {
+  const [text, setText] = useState('');
+  const [err, setErr] = useState(error || '');
+  return (
+    <div className="max-w-xl mx-auto p-4 sm:p-8 grid gap-4">
+      <h1 className="font-display text-2xl font-bold text-navy">ERAMAS GROUP Appreciation Luncheon · Check-in</h1>
+      <div className="bg-white rounded-xl border border-slate-200 p-5 grid gap-3">
+        <h2 className="font-display text-lg font-bold text-navy">Connect to your Firebase project</h2>
+        <p className="text-sm text-slate-600">Paste the <b>firebaseConfig</b> from Firebase → Project settings → Your apps. Every device that pastes the same config shares the same live guest list. The set-up steps are in README.md.</p>
+        <textarea className="border border-slate-300 rounded-lg p-3 font-mono text-xs min-h-[140px]" value={text} onChange={e => setText(e.target.value)} placeholder={'const firebaseConfig = {\n  apiKey: "…",\n  authDomain: "…",\n  projectId: "…",\n  appId: "…"\n};'} aria-label="Firebase config" />
+        {err && <p className="text-sm text-red-700">{err}</p>}
+        <div className="flex flex-wrap gap-2">
+          <Btn onClick={() => { try { onConnect(parseConfig(text)); } catch (e) { setErr('That config could not be read: ' + e.message); } }}>Connect</Btn>
+        </div>
+      </div>
+      <div className="bg-white rounded-xl border border-slate-200 p-5 grid gap-3">
+        <h2 className="font-display text-lg font-bold text-navy">Just trying it out?</h2>
+        <p className="text-sm text-slate-600">Demo mode keeps the guest list on this device only (tabs on the same browser stay in sync). Use it for a rehearsal, not on the day.</p>
+        <div><Btn kind="ghost" onClick={onDemo}>Open in demo mode</Btn></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Main app ---------------- */
+function useHash() {
+  const get = () => (['checkin', 'tables', 'guests'].includes(location.hash.slice(1)) ? location.hash.slice(1) : 'checkin');
+  const [v, setV] = useState(get);
+  useEffect(() => { const f = () => setV(get()); window.addEventListener('hashchange', f); return () => window.removeEventListener('hashchange', f); }, []);
+  return v;
+}
+
+function App() {
+  const [mode, setMode] = useState(() => {
+    if (window.FIREBASE_CONFIG) return { kind: 'firebase', cfg: window.FIREBASE_CONFIG };
+    try { const s = JSON.parse(localStorage.getItem('eramas-mode') || 'null'); if (s) return s; } catch (e) {}
+    return null;
+  });
+  const [setupErr, setSetupErr] = useState('');
+  const store = useMemo(() => {
+    if (!mode) return null;
+    try { return mode.kind === 'local' ? makeLocalStore() : makeFirebaseStore(mode.cfg); }
+    catch (e) { setSetupErr('Could not start Firebase: ' + e.message); return null; }
+  }, [mode]);
+  const [user, setUser] = useState(undefined);
+  useEffect(() => { if (store && store.kind === 'firebase') return store.auth.onAuthStateChanged(u => setUser(u || null)); }, [store]);
+  const choose = m => { try { localStorage.setItem('eramas-mode', JSON.stringify(m)); } catch (e) {} setMode(m); };
+  const disconnect = () => { try { localStorage.removeItem('eramas-mode'); } catch (e) {} location.reload(); };
+  if (!store) return <Setup error={setupErr} onConnect={cfg => choose({ kind: 'firebase', cfg })} onDemo={() => choose({ kind: 'local' })} />;
+  const onDisconnect = window.FIREBASE_CONFIG ? null : disconnect;
+  if (store.kind === 'local') return <Main store={store} user={null} admin={true} onDisconnect={onDisconnect} />;
+  if (user === undefined) return <p className="p-6 text-slate-500">Checking sign-in…</p>;
+  if (!user) return <Login auth={store.auth} onDisconnect={onDisconnect} />;
+  const admin = (window.ADMIN_EMAILS || []).map(e => e.toLowerCase()).includes((user.email || '').toLowerCase());
+  return <Main store={store} user={user} admin={admin} onDisconnect={onDisconnect} />;
+}
+
+function Login({ auth, onDisconnect }) {
+  const [email, setEmail] = useState(''); const [pw, setPw] = useState(''); const [err, setErr] = useState(''); const [busy, setBusy] = useState(false);
+  const submit = async e => {
+    e.preventDefault(); setBusy(true); setErr('');
+    try { await auth.signInWithEmailAndPassword(email.trim(), pw); }
+    catch (x) { setErr(x.code === 'auth/too-many-requests' ? 'Too many attempts. Wait a few minutes and try again.' : /invalid|wrong|not-found|user-disabled/.test(x.code || '') ? 'Wrong email or password.' : 'Could not sign in: ' + (x.message || x.code)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <form onSubmit={submit} className="max-w-sm mx-auto mt-10 p-6 bg-white rounded-xl border border-slate-200 grid gap-3">
+      <h1 className="font-display text-xl font-bold text-navy">ERAMAS Luncheon · Crew sign-in</h1>
+      <p className="text-sm text-slate-600">For event crew only. Ask the organiser for the login.</p>
+      <label className="grid gap-1 text-sm font-semibold">Email<input type="email" autoComplete="username" required value={email} onChange={e => setEmail(e.target.value)} className="border border-slate-300 rounded-lg px-3 py-2 font-normal" /></label>
+      <label className="grid gap-1 text-sm font-semibold">Password<input type="password" autoComplete="current-password" required value={pw} onChange={e => setPw(e.target.value)} className="border border-slate-300 rounded-lg px-3 py-2 font-normal" /></label>
+      {err && <p className="text-sm text-red-700">{err}</p>}
+      <Btn type="submit" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</Btn>
+      {onDisconnect && <button type="button" onClick={onDisconnect} className="text-xs text-slate-500 underline justify-self-start">Change Firebase connection</button>}
+    </form>
+  );
+}
+
+function Main({ store, user, admin, onDisconnect }) {
+  const view = useHash();
+  const [guests, setGuests] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [offline, setOffline] = useState(false);
+  const [error, setError] = useState('');
+  const [pending, setPending] = useState({});
+  const [toast, setToast] = useState('');
+  const signOut = async () => { await store.signOut(); location.reload(); };
+  const toastT = useRef();
+
+  useEffect(() => {
+    const t = setTimeout(() => { if (!loaded) setError('Still connecting… check this device’s internet connection.'); }, 10000);
+    const unsub = store.subscribe((list, fromCache) => {
+      setGuests(list.map(d => ({ name: '', org: '', table: '', draw: '', diet: '', ...d, name: String(d.name || ''), org: String(d.org || ''), table: String(d.table || ''), draw: String(d.draw || ''), diet: String(d.diet || '') })));
+      setLoaded(true); setOffline(!!fromCache); if (!fromCache) { clearTimeout(t); setError(''); }
+    }, e => { clearTimeout(t); setLoaded(true); setError(e.code === 'permission-denied' ? 'This account is not allowed to see the guest list. The organiser must add its email to the Firestore rules.' : 'Connection problem: ' + (e.message || e.code)); });
+    return () => { clearTimeout(t); unsub(); };
+  }, [store]);
+
+  const say = useCallback(m => { setToast(m); clearTimeout(toastT.current); toastT.current = setTimeout(() => setToast(''), 2600); }, []);
+  const write = useCallback(async (id, patch) => {
+    if (pending[id]) return false;
+    setPending(p => ({ ...p, [id]: true }));
+    try { await store.update(id, patch); return true; }
+    catch (e) { say('Could not save: ' + (e.message || e.code)); return false; }
+    finally { setPending(p => { const n = { ...p }; delete n[id]; return n; }); }
+  }, [store, pending, say]);
+
+  const sorted = useMemo(() => [...guests].sort((a, b) => sortName(a.name).localeCompare(sortName(b.name), 'en', { sensitivity: 'base' })), [guests]);
+  const stats = useMemo(() => {
+    const t = Object.fromEntries(TABLES.map(x => [x.key, { n: 0, reg: 0, seat: 0, odd: 0 }]));
+    guests.forEach(g => { const s = t[g.table]; if (!s) return; s.n++; if (g.checkedIn) s.reg++; if (g.seated) s.seat++; if (g.seated && !g.checkedIn) s.odd++; });
+    const used = TABLES.filter(x => t[x.key].n > 0);
+    return { tables: t, reg: guests.filter(g => g.checkedIn).length, seat: guests.filter(g => g.seated).length, full: used.filter(x => t[x.key].seat >= t[x.key].n).length, used: used.length };
+  }, [guests]);
+
+  const ctx = { store, guests, sorted, stats, loaded, pending, write, say, admin };
+  return (
+    <div className="min-h-full">
+      <header className="sticky top-0 z-10 bg-white border-b border-slate-200">
+        <div className="max-w-6xl mx-auto px-4 pt-3 pb-2 flex flex-wrap items-center gap-x-6 gap-y-2">
+          <div className="mr-auto">
+            <div className="font-display text-lg font-bold text-navy leading-tight">ERAMAS GROUP Appreciation Luncheon</div>
+            <div className="text-xs text-slate-500">Mon 23 Nov 2026 · Hall C, Eden · Registration 11:15–11:35 AM{store.kind === 'local' && <span className="ml-2 font-bold text-amber-700 bg-amber-100 px-1.5 rounded">DEMO · this device only</span>}</div>
+          </div>
+          {[['Registered', loaded ? `${stats.reg} / ${guests.length}` : '–'], ['Seated', loaded ? `${stats.seat} / ${guests.length}` : '–'], ['Tables complete', loaded ? `${stats.full} / ${stats.used || 36}` : '–']].map(([k, v]) => (
+            <div key={k} className="grid tabnum"><span className="text-[11px] uppercase tracking-wide text-slate-500">{k}</span><strong className="text-lg">{v}</strong></div>
+          ))}
+        </div>
+        <nav className="max-w-6xl mx-auto px-4 flex gap-1 overflow-x-auto items-center" aria-label="Views">
+          {[['checkin', 'Check-in'], ['tables', 'Tables'], ['guests', 'Guest list']].map(([k, l]) => (
+            <a key={k} href={'#' + k} aria-current={view === k ? 'page' : undefined} className={`px-3.5 py-2.5 font-semibold no-underline border-b-[3px] whitespace-nowrap ${view === k ? 'text-slate-900 border-gold' : 'text-slate-500 border-transparent'}`}>{l}</a>
+          ))}
+          {user && <span className="ml-auto flex items-center gap-2 text-xs text-slate-500 whitespace-nowrap pl-3">{user.email}{admin && <b className="text-gold">· Organiser</b>}<button onClick={signOut} className="underline font-semibold text-slate-700">Sign out</button></span>}
+        </nav>
+      </header>
+      <main className="max-w-6xl mx-auto p-4 grid gap-4">
+        {error && <div className="rounded-lg bg-amber-100 px-4 py-2.5 text-sm">{error}</div>}
+        {offline && !error && <div className="rounded-lg bg-amber-100 px-4 py-2.5 text-sm">Offline: showing the last saved list. Check-ins on this device will sync when the connection returns.</div>}
+        {view === 'checkin' && <CheckIn {...ctx} />}
+        {view === 'tables' && <Tables {...ctx} />}
+        {view === 'guests' && <Guests {...ctx} onDisconnect={onDisconnect} />}
+      </main>
+      {toast && <div role="status" className="fixed left-1/2 -translate-x-1/2 bottom-5 bg-navy text-white font-semibold px-5 py-3 rounded-xl shadow-lg z-30 max-w-[92vw]">{toast}</div>}
+    </div>
+  );
+}
+
+function Empty({ admin }) {
+  return <div className="bg-white rounded-xl border border-slate-200 p-8 text-center text-slate-500"><b className="text-slate-800">No guests loaded yet.</b><br />{admin ? <span>Go to <a className="underline" href="#guests">Guest list</a> to import the list or load sample guests.</span> : 'The organiser needs to import the guest list first (Guest list tab).'}</div>;
+}
+
+/* ---------------- Check-in (registration counters) ---------------- */
+function CheckIn({ sorted, loaded, pending, write, say, admin }) {
+  const [counter, setCounter] = useState(() => { try { return localStorage.getItem('eramas-counter') || 'all'; } catch (e) { return 'all'; } });
+  const [q, setQ] = useState('');
+  const input = useRef();
+  useEffect(() => { try { localStorage.setItem('eramas-counter', counter); } catch (e) {} }, [counter]);
+  const nq = norm(q.trim());
+  let list = sorted.filter(g => inCounter(g, counter));
+  list = nq ? list.filter(g => norm(g.name).includes(nq) || norm(g.org).includes(nq) || g.draw.includes(nq)) : list.filter(g => !g.checkedIn);
+  const total = list.length; list = list.slice(0, nq ? 40 : 25);
+  const checkIn = async (g, on) => {
+    const ok = await write(g.id, on ? { checkedIn: true, checkedInAt: Date.now() } : { checkedIn: false, checkedInAt: null });
+    if (ok && on) { say(`✓ ${g.name} → ${tLabel(g.table)}`); setQ(''); input.current && input.current.focus(); }
+  };
+  if (!loaded) return <p className="text-slate-500">Loading guest list…</p>;
+  if (!sorted.length) return <Empty admin={admin} />;
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-slate-200 p-4 grid gap-3">
+        <div className="flex flex-wrap gap-1.5" role="group" aria-label="Counter">{COUNTERS.map(([k, l]) => <Chip key={k} on={counter === k} onClick={() => { setCounter(k); input.current.focus(); }}>{l}</Chip>)}</div>
+        <input ref={input} type="search" value={q} onChange={e => setQ(e.target.value)} autoFocus autoComplete="off" aria-label="Search guest"
+          onKeyDown={e => { if (e.key === 'Enter' && list[0] && !list[0].checkedIn) checkIn(list[0], true); }}
+          placeholder="Type a name, company or lucky draw no." className="w-full px-4 py-3.5 text-lg border-2 border-slate-200 rounded-xl focus:border-gold outline-none" />
+        <p className="text-sm text-slate-500">{nq ? `${total} match${total === 1 ? '' : 'es'}${total > 40 ? ' · showing first 40, keep typing' : ''} · press Enter to check in the first match` : `${total} still to register at this counter${total > 25 ? ' · type to search' : ''}`}</p>
+      </div>
+      <div className="grid gap-2">
+        {list.length === 0 && <div className="bg-white rounded-xl border border-slate-200 p-6 text-center text-slate-500">{nq ? 'No guest found. Check the spelling, try the company name, or call the Floor Captain.' : 'Everyone at this counter is registered.'}</div>}
+        {list.map(g => (
+          <div key={g.id} className="bg-white rounded-xl border border-slate-200 border-l-[6px] p-3.5 grid sm:grid-cols-[1fr_auto] gap-3 items-center" style={{ borderLeftColor: zColor(g.table) }}>
+            <div>
+              <b className="text-lg block break-words">{g.name}</b>
+              {g.org && <span className="text-sm text-slate-500">{g.org}</span>}
+              <div className="flex flex-wrap gap-2 items-center mt-1.5">
+                <span className="font-bold px-2.5 py-0.5 rounded-md tabnum" style={{ background: zColor(g.table) + '26' }}>{tLabel(g.table)}</span>
+                {TMAP[g.table] && <span className="text-sm text-slate-500">{TMAP[g.table].zone === 'V' ? 'VIP area' : 'Zone ' + TMAP[g.table].zone}</span>}
+                {g.draw && <span className="text-sm text-slate-500 tabnum">Draw no. {g.draw}</span>}
+                {isDiet(g.diet) && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">{g.diet}</span>}
+              </div>
+            </div>
+            {g.checkedIn
+              ? <div className="grid sm:justify-items-end gap-1"><span className="text-xs font-bold px-2.5 py-1 rounded-full bg-green-100 text-green-800">✓ Registered {fmtTime(g.checkedInAt)}</span><Btn kind="ghost" className="py-1.5" disabled={pending[g.id]} onClick={() => checkIn(g, false)}>Undo</Btn></div>
+              : <Btn kind="good" className="min-w-[130px] py-3" disabled={pending[g.id]} onClick={() => checkIn(g, true)}>{pending[g.id] ? 'Saving…' : 'Check in'}</Btn>}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* ---------------- Tables (ushers / Floor Captain) ---------------- */
+function Tables({ sorted, stats, loaded, pending, write, admin }) {
+  const [filter, setFilter] = useState('all');
+  const [open, setOpen] = useState(null);
+  const [, tick] = useState(0);
+  useEffect(() => { const i = setInterval(() => tick(x => x + 1), 60000); return () => clearInterval(i); }, []);
+  const now = new Date(); const late = now.getHours() * 60 + now.getMinutes() >= 11 * 60 + 35;
+  if (!loaded) return <p className="text-slate-500">Loading tables…</p>;
+  if (!sorted.length) return <Empty admin={admin} />;
+  const t = stats.tables;
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-slate-200 p-4 grid gap-2">
+        <div className="flex flex-wrap gap-1.5">{[['all', 'All tables'], ['open', 'Not complete'], ['A', 'Zone A'], ['B', 'Zone B'], ['C', 'Zone C'], ['V', 'VIP']].map(([k, l]) => <Chip key={k} on={filter === k} onClick={() => setFilter(k)}>{l}</Chip>)}</div>
+        <p className="text-sm text-slate-500">Ushers: open your table and tap <b>Seated</b> as each guest sits down. A table turns green when everyone on its list is seated. An orange outline means someone is seated without registering, or (after 11:35 AM) registered but not yet seated.</p>
+      </div>
+      {['V', 'A', 'B', 'C'].filter(z => ['all', 'open', z].includes(filter)).map(z => {
+        let tbls = TABLES.filter(x => x.zone === z && (t[x.key].n > 0 || x.zone === 'V'));
+        if (filter === 'open') tbls = tbls.filter(x => t[x.key].n === 0 || t[x.key].seat < t[x.key].n);
+        if (!tbls.length) return null;
+        return (
+          <section key={z} className="grid gap-2">
+            <h2 className="font-display font-bold text-navy flex items-center gap-2"><i className="w-3 h-3 rounded-sm inline-block" style={{ background: ZONES[z].color }} />{ZONES[z].name}</h2>
+            <div className="grid gap-2 grid-cols-[repeat(auto-fill,minmax(150px,1fr))]">
+              {tbls.map(x => {
+                const s = t[x.key], full = s.n > 0 && s.seat >= s.n, alert = s.odd > 0 || (late && s.reg > s.seat), base = Math.max(s.n, 1);
+                return (
+                  <button key={x.key} onClick={() => setOpen(x.key)} className={`text-left rounded-xl border border-slate-200 border-t-[5px] p-3 grid gap-1.5 ${full ? 'bg-green-50' : 'bg-white'} ${alert ? 'ring-2 ring-orange-500' : ''}`} style={{ borderTopColor: ZONES[x.zone].color }}>
+                    <b className="flex justify-between items-center">{x.label}{full && <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-green-100 text-green-800">Full</span>}</b>
+                    <div className="h-2 rounded bg-slate-100 overflow-hidden flex"><i className="block h-full bg-green-600" style={{ width: `${(100 * s.seat) / base}%` }} /><i className="block h-full bg-gold" style={{ width: `${(100 * Math.max(0, s.reg - s.seat + s.odd)) / base}%` }} /></div>
+                    <span className="text-xs text-slate-500 tabnum">Seated {s.seat}/{s.n} · Registered {s.reg}{s.n !== x.cap ? ` · ${s.n} on list (${x.cap} seats)` : ''}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </section>
+        );
+      })}
+      {open && (
+        <Sheet title={`${tLabel(open)} · ${t[open].seat}/${t[open].n} seated`} onClose={() => setOpen(null)}>
+          {sorted.filter(g => g.table === open).map(g => (
+            <div key={g.id} className="grid grid-cols-[1fr_auto_auto] gap-2 items-center py-2 border-t border-slate-200">
+              <div><b className="break-words">{g.name}</b><div className="text-xs text-slate-500">{[g.org, g.draw && 'Draw ' + g.draw, isDiet(g.diet) && g.diet].filter(Boolean).join(' · ')}</div></div>
+              <Pill g={g} />
+              <Btn kind={g.seated ? 'ghost' : 'good'} className="min-w-[96px] py-2" disabled={pending[g.id]} onClick={() => write(g.id, g.seated ? { seated: false, seatedAt: null } : { seated: true, seatedAt: Date.now() })}>{g.seated ? 'Unseat' : 'Seated'}</Btn>
+            </div>
+          ))}
+          {!sorted.some(g => g.table === open) && <p className="text-slate-500">No guests are assigned to this table.</p>}
+        </Sheet>
+      )}
+    </>
+  );
+}
+
+function Sheet({ title, onClose, children }) {
+  useEffect(() => { const f = e => e.key === 'Escape' && onClose(); window.addEventListener('keydown', f); return () => window.removeEventListener('keydown', f); }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-20 bg-slate-900/45 grid place-items-end sm:place-items-center p-3" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div role="dialog" aria-modal="true" aria-label={title} className="w-full max-w-xl max-h-[88vh] overflow-auto bg-white rounded-2xl p-4 grid gap-2">
+        <div className="flex justify-between items-center gap-2"><h3 className="font-display text-lg font-bold text-navy">{title}</h3><Btn kind="ghost" className="py-1.5" onClick={onClose}>Close</Btn></div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Guest list + admin ---------------- */
+function Guests({ store, guests, sorted, loaded, write, say, admin, onDisconnect }) {
+  const [q, setQ] = useState(''); const [f, setF] = useState('all'); const [edit, setEdit] = useState(null);
+  const nq = norm(q.trim());
+  const list = sorted.filter(g => (!nq || norm(g.name).includes(nq) || norm(g.org).includes(nq) || norm(tLabel(g.table)).includes(nq)) && (f === 'all' || statusOf(g) === f || (f === 'seat' && statusOf(g) === 'odd')));
+  const exportCsv = () => {
+    // Prefix cells starting with = + - @ so Excel cannot run them as formulas.
+    const esc = v => { if (/^[=+\-@\t\r]/.test(v)) v = "'" + v; return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    const rows = [['Name', 'Company', 'Table', 'Dietary', 'Lucky draw no.', 'Registered', 'Registered at', 'Seated']].concat(sorted.map(g => [g.name, g.org, tLabel(g.table), g.diet, g.draw, g.checkedIn ? 'Yes' : 'No', fmtTime(g.checkedInAt), g.seated ? 'Yes' : 'No']));
+    const blob = new Blob(['﻿' + rows.map(r => r.map(x => esc(String(x))).join(',')).join('\n')], { type: 'text/csv' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'eramas-luncheon-attendance.csv'; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
+  return (
+    <>
+      <div className="bg-white rounded-xl border border-slate-200 p-4 grid gap-3">
+        <div className="flex flex-wrap gap-2">
+          <input className="flex-1 min-w-[200px] border border-slate-300 rounded-lg px-3 py-2" placeholder="Filter by name, company or table" value={q} onChange={e => setQ(e.target.value)} aria-label="Filter guest list" />
+          <select className="border border-slate-300 rounded-lg px-3 py-2 bg-white" value={f} onChange={e => setF(e.target.value)} aria-label="Status filter">
+            <option value="all">All guests</option><option value="none">Not arrived</option><option value="reg">Registered, not seated</option><option value="seat">Seated</option>
+          </select>
+          <Btn kind="ghost" onClick={exportCsv} disabled={!guests.length}>Download report (CSV)</Btn>
+        </div>
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead><tr className="text-left text-xs uppercase tracking-wide text-slate-500">{['Name', 'Company', 'Table', 'Draw no.', 'Status', ''].map(h => <th key={h} className="p-2 border-b border-slate-200">{h}</th>)}</tr></thead>
+            <tbody>
+              {!loaded && <tr><td colSpan="6" className="p-6 text-center text-slate-500">Loading…</td></tr>}
+              {loaded && !guests.length && <tr><td colSpan="6" className="p-6 text-center text-slate-500">No guests yet.{admin ? ' Import the list below.' : ''}</td></tr>}
+              {list.slice(0, 400).map(g => (
+                <tr key={g.id} className="align-top">
+                  <td className="p-2 border-b border-slate-100">{g.name}{isDiet(g.diet) && <span className="ml-1.5 text-[11px] font-bold text-emerald-800 bg-emerald-100 px-1.5 rounded">{g.diet}</span>}{g.sample && <span className="ml-1.5 text-[11px] font-bold text-amber-800 bg-amber-100 px-1.5 rounded">Sample</span>}</td>
+                  <td className="p-2 border-b border-slate-100">{g.org}</td>
+                  <td className="p-2 border-b border-slate-100 whitespace-nowrap">{tLabel(g.table)}</td>
+                  <td className="p-2 border-b border-slate-100 tabnum">{g.draw}</td>
+                  <td className="p-2 border-b border-slate-100"><Pill g={g} />{g.checkedInAt && <div className="text-xs text-slate-500 mt-1">Reg. {fmtTime(g.checkedInAt)}</div>}</td>
+                  <td className="p-2 border-b border-slate-100"><Btn kind="ghost" className="py-1" onClick={() => setEdit(g)}>Edit</Btn></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      {admin ? <Admin store={store} guests={guests} say={say} onDisconnect={onDisconnect} />
+        : <div className="bg-white rounded-xl border border-slate-200 p-4 text-sm text-slate-600">Organiser tools (import, reset, delete) are only available to the organiser account.</div>}
+      {edit && <EditGuest g={edit} admin={admin} store={store} write={write} say={say} onClose={() => setEdit(null)} />}
+    </>
+  );
+}
+
+function Admin({ store, guests, say, onDisconnect }) {
+  const [text, setText] = useState(''); const [msg, setMsg] = useState(''); const [busy, setBusy] = useState(false); const [sure, setSure] = useState(false); const [wipe, setWipe] = useState('');
+  const fileRef = useRef();
+  const load = async (records, label, extra = '') => {
+    setBusy(true);
+    try { await store.replaceAll(records, guests.map(g => g.id), (n, t) => setMsg(`${label}: ${n} of ${t} saved…`)); setMsg(`${label} complete: ${records.length} guests loaded.${extra}`); }
+    catch (e) { setMsg(`${label} failed: ${e.message || e.code}`); }
+    finally { setBusy(false); }
+  };
+  const doImport = async () => {
+    let t = text; const file = fileRef.current.files[0];
+    if (!t.trim() && file) t = await file.text();
+    if (!t.trim()) return setMsg('Choose a CSV file or paste rows first.');
+    let rows = parseCSV(t);
+    // Columns are found by their headings (Guest Name, Company/Organization, Table Assignment, Dietary Restrictions, Lucky draw no., Checked In).
+    // With no heading row, the order Name, Company, Table, Lucky draw no. is assumed.
+    let col = { name: 0, org: 1, table: 2, draw: 3, diet: -1, chk: -1 };
+    if (rows.length && rows[0].some(h => /name/i.test(h)) && rows[0].some(h => /table/i.test(h))) {
+      const H = rows[0]; const find = re => H.findIndex(h => re.test(h));
+      col = { name: find(/name/i), org: find(/company|organi[sz]ation|org\b/i), table: find(/table/i), draw: find(/draw|lucky/i), diet: find(/diet/i), chk: find(/checked/i) };
+      rows = rows.slice(1);
+    }
+    const at = (r, i) => (i >= 0 ? (r[i] || '').trim() : '');
+    const bad = [], recs = [];
+    rows.forEach((r, i) => {
+      const tb = normTable(at(r, col.table)); const name = at(r, col.name);
+      if (!name || !tb) return bad.push(i + 2);
+      const done = /^(yes|y|true|1)$/i.test(at(r, col.chk));
+      recs.push({ id: 'g' + String(recs.length + 1).padStart(4, '0'), data: blank({ name, org: at(r, col.org), table: tb, draw: at(r, col.draw), diet: at(r, col.diet), checkedIn: done, checkedInAt: done ? Date.now() : null }) });
+    });
+    if (!recs.length) return setMsg('No valid rows found. Each row needs a name and a table (1–33, VIP 1, VIP 2 or VVIP).');
+    await load(recs, 'Import', bad.length ? ` Skipped ${bad.length} row(s) with no name or an unknown table: ${bad.slice(0, 10).join(', ')}${bad.length > 10 ? '…' : ''}.` : '');
+  };
+  const reset = async () => {
+    if (!sure) { setSure(true); setTimeout(() => setSure(false), 5000); return; }
+    setSure(false); setBusy(true);
+    try { const ids = guests.filter(g => g.checkedIn || g.seated).map(g => g.id); await store.patchMany(ids, { checkedIn: false, checkedInAt: null, seated: false, seatedAt: null }); setMsg(`Cleared ${ids.length} check-ins.`); }
+    catch (e) { setMsg('Reset failed: ' + (e.message || e.code)); } finally { setBusy(false); }
+  };
+  const deleteAll = async () => {
+    if (wipe !== 'DELETE') return setMsg('Type DELETE in the box first.');
+    setBusy(true); setWipe('');
+    try { await store.removeAll(guests.map(g => g.id), (n, t) => setMsg(`Deleting: ${n} of ${t}…`)); setMsg('All guest data deleted from the database.'); }
+    catch (e) { setMsg('Delete failed: ' + (e.message || e.code)); } finally { setBusy(false); }
+  };
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 p-4 grid gap-3">
+      <div className="flex justify-between items-center gap-2"><h3 className="font-display text-lg font-bold text-navy">Organiser tools</h3></div>
+      <p className="text-sm text-slate-600">Use a CSV with a heading row: <b>Guest Name, Company/Organization, Table Assignment</b>, and optionally <b>Dietary Restrictions, Lucky draw no., Checked In</b> (any order). Table can be 1–33 or “Table 7”, VIP 1, VIP 2 or VVIP. Save CSVs as <b>CSV UTF-8</b> so Chinese names survive. You can also paste straight from Excel. Importing replaces the whole list.</p>
+      <label className="grid gap-1 text-sm font-semibold">CSV file<input ref={fileRef} type="file" accept=".csv,text/csv,text/plain" /></label>
+      <label className="grid gap-1 text-sm font-semibold">Or paste rows<textarea value={text} onChange={e => setText(e.target.value)} className="border border-slate-300 rounded-lg p-3 font-mono text-xs min-h-[120px]" placeholder={'Name,Company,Table,Lucky draw no.\nTan Mei Ling,ABC Sdn Bhd,7,0123'} /></label>
+      <div className="flex flex-wrap gap-2">
+        <Btn disabled={busy} onClick={doImport}>Import and replace list</Btn>
+        <Btn kind="ghost" disabled={busy} onClick={() => load(sampleRecords(), 'Sample list')}>Load 365 sample guests (trial run)</Btn>
+        <Btn kind="danger" disabled={busy} onClick={reset}>{sure ? 'Tap again to clear every check-in' : 'Clear all check-ins'}</Btn>
+        {onDisconnect && <Btn kind="ghost" onClick={onDisconnect}>Change connection</Btn>}
+      </div>
+      {msg && <p className="text-sm text-slate-600" aria-live="polite">{msg}</p>}
+      <div className="border-t border-slate-200 pt-3 grid gap-2">
+        <b className="text-sm text-red-700">After the event: delete all guest data</b>
+        <p className="text-sm text-slate-600">Download the report first. This permanently removes every guest record (names, companies, dietary info) from Firebase.</p>
+        <div className="flex flex-wrap gap-2">
+          <input value={wipe} onChange={e => setWipe(e.target.value)} placeholder="Type DELETE" aria-label="Type DELETE to confirm" className="border border-slate-300 rounded-lg px-3 py-2 w-36" />
+          <Btn kind="danger" disabled={busy || !guests.length} onClick={deleteAll}>Delete all guest data</Btn>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditGuest({ g, admin, store, write, say, onClose }) {
+  const [v, setV] = useState({ name: g.name, org: g.org, table: g.table, draw: g.draw, diet: g.diet || '' }); const [sure, setSure] = useState(false);
+  const field = (k, label, el) => <label className="grid gap-1 text-sm font-semibold">{label}{el}</label>;
+  const inp = k => <input className="border border-slate-300 rounded-lg px-3 py-2" value={v[k]} onChange={e => setV({ ...v, [k]: e.target.value })} />;
+  return (
+    <Sheet title="Edit guest" onClose={onClose}>
+      <p className="text-sm text-slate-500">For a replacement guest, change the name here. They keep the original table and lucky draw number.</p>
+      {field('name', 'Name', inp('name'))}{field('org', 'Company', inp('org'))}
+      {field('table', 'Table', <select className="border border-slate-300 rounded-lg px-3 py-2 bg-white" value={v.table} onChange={e => setV({ ...v, table: e.target.value })}>{TABLES.map(t => <option key={t.key} value={t.key}>{t.label}</option>)}</select>)}
+      {field('draw', 'Lucky draw no.', inp('draw'))}{field('diet', 'Dietary', inp('diet'))}
+      <div className="flex flex-wrap gap-2 pt-1">
+        <Btn onClick={async () => { if (!v.name.trim()) return say('Name cannot be empty.'); if (await write(g.id, { name: v.name.trim(), org: v.org.trim(), table: v.table, draw: v.draw.trim(), diet: v.diet.trim() })) { say('Saved'); onClose(); } }}>Save</Btn>
+        {admin && <Btn kind="danger" onClick={async () => { if (!sure) return setSure(true); try { await store.remove(g.id); say('Guest removed'); onClose(); } catch (e) { say('Could not remove: ' + e.message); } }}>{sure ? 'Tap again to remove' : 'Remove guest'}</Btn>}
+      </div>
+    </Sheet>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---- EDIT THESE TWO LISTS (lower-case emails) ----
+    // Organiser: can import, edit, delete and wipe the guest list.
+    function isAdmin() {
+      return request.auth != null
+        && request.auth.token.email in ['admin@checkin.eramas.my'];
+    }
+    // Crew (counters + ushers): can view guests and tick check-in / seated.
+    function isCrew() {
+      return request.auth != null
+        && request.auth.token.email in ['crew@checkin.eramas.my'];
+    }
+    // ---------------------------------------------------
+
+    function validGuest(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 200
+        && d.table is string && d.table.size() <= 10
+        && d.checkedIn is bool && d.seated is bool;
+    }
+
+    match /guests/{id} {
+      allow read: if isAdmin() || isCrew();
+      allow create: if isAdmin() && validGuest(request.resource.data);
+      allow delete: if isAdmin();
+      allow update: if validGuest(request.resource.data) && (
+        isAdmin() ||
+        (isCrew() && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['checkedIn', 'checkedInAt', 'seated', 'seatedAt', 'name', 'org', 'diet', 'table', 'draw']))
+      );
+    }
+
+    // Everything else is locked.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

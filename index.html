@@ -54,7 +54,7 @@ const { useState, useEffect, useMemo, useRef, useCallback } = React;
 
 /* ---------------- Event set-up ---------------- */
 const TABLES = [];
-for (let n = 1; n <= 30; n++) TABLES.push({ key: String(n), label: 'Table ' + n, zone: n <= 11 ? 'A' : n <= 19 ? 'B' : 'C', cap: 11 });
+for (let n = 1; n <= 30; n++) TABLES.push({ key: String(n), label: 'Table ' + n, zone: n <= 10 ? 'A' : n <= 19 ? 'B' : 'C', cap: 11 });
 TABLES.push({ key: 'VVIP', label: 'VVIP', zone: 'V', cap: 15 }, { key: 'VIP 1', label: 'VIP 1', zone: 'V', cap: 10 }, { key: 'VIP 2', label: 'VIP 2', zone: 'V', cap: 10 });
 const TMAP = Object.fromEntries(TABLES.map(t => [t.key, t]));
 const ZONES = {
